@@ -1,6 +1,7 @@
 import os
 import random
 import torch
+import torch_npu
 import torch.distributed as dist
 
 # ========= DDP helpers =========
@@ -31,7 +32,7 @@ def barrier():
 def ddp_init_if_needed():
     # Only initialize if we're truly in a multi-process setting
     if should_use_ddp() and dist.is_available() and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        backend = "hccl" if torch_npu.npu.is_available() else "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
         # Make printing on non-zero ranks quieter
         if not is_main_process():

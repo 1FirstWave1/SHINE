@@ -2,6 +2,7 @@ import importlib
 import os
 from typing import Any, Dict
 import torch
+import torch_npu
 from utils.myddp import get_local_rank
 
 def _resolve_device(device_cfg: str) -> torch.device:
@@ -18,6 +19,11 @@ def _resolve_device(device_cfg: str) -> torch.device:
             torch.cuda.set_device(local_rank)
             return torch.device(f"cuda:{local_rank}")
         return torch.device(device_cfg)
+    if device_cfg == "npu":
+        local_rank = get_local_rank()
+        torch_npu.npu.set_device(local_rank)
+        return torch.device(f"npu:{local_rank}")
+
     raise ValueError(f"Unsupported device setting: {device_cfg}")
 
 

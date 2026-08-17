@@ -46,23 +46,21 @@ class LoraLinear(nn.Linear):
         Lb = A.shape[0]
         torch._assert(input.shape[-1] == self.in_features, "last dim must be in_features")
         torch._assert(input.shape[0] % Lb == 0, "input batch must be multiple of lora batch")
-        num_beams = input.shape[0] // Lb
 
-        # Flatten all middle dims (e.g., seq_len) into S for faster matmul
-        # input: [B, ..., in] -> x: [Lb, beams, S, in]
-        x = input.reshape(Lb, num_beams, -1, self.in_features)
+        # input: [Lb * beams, ..., in] -> x: [Lb, beams * ..., in]
+        x = input.reshape(Lb, -1, self.in_features)
 
-        # [Lb, beams, S, in] @ [Lb, in, r] -> [Lb, beams, S, r]
-        tmp = torch.matmul(x, A[:, None, :, :])
-        # [Lb, beams, S, r] @ [Lb, r, out] -> [Lb, beams, S, out]
-        lora_out = torch.matmul(tmp, B[:, None, :, :])
+        # [Lb, N, in] @ [Lb, in, r] -> [Lb, N, r]
+        tmp = torch.bmm(x, A)
+        # [Lb, N, r] @ [Lb, r, out] -> [Lb, N, out]
+        lora_out = torch.bmm(tmp, B)
 
         if self.bias is None:
             torch._assert(C is None, "If bias is None, lora_dict['C'] must also be None")
         else:
             torch._assert(C is not None, "If bias is not None, lora_dict['C'] must also be not None")
-            # C: [Lb, out] -> [Lb, 1, 1, out] broadcast across beams and S
-            lora_out = lora_out + C[:, None, None, :]
+            # C: [Lb, out] -> [Lb, 1, out], broadcast across N.
+            lora_out = lora_out + C.unsqueeze(1)
 
         # Restore original middle dims: [Lb*beams, ..., out]
         lora_out = lora_out.reshape(*input.shape[:-1], self.out_features)

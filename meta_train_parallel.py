@@ -14,6 +14,7 @@ import numpy as np
 import math
 
 import torch
+import torch_npu
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -74,9 +75,9 @@ from collections import OrderedDict
 from typing import Optional, Union, Mapping, Sequence
 
 logger = get_logger("metalora")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+torch_npu.npu.matmul.allow_hf32 = True
+torch_npu.npu.conv.allow_hf32 = True
 
 # @torch.no_grad()
 # def generate_stepwise(
@@ -300,9 +301,9 @@ def evaluate(metanetwork_ddp_or_module, dataloader, device, use_amp: bool = Fals
     total_reg_loss = 0.0
     n_tokens = 0
     amp_ctx = torch.amp.autocast(
-            device_type="cuda",
+            device_type="npu",
             dtype=(amp_dtype or torch.bfloat16),
-            enabled=(use_amp and device.type == "cuda")
+            enabled=(use_amp and device.type == "npu")
         )
     
     for i, batch in enumerate(dataloader):
@@ -436,7 +437,7 @@ def main(cfg: DictConfig):
     # Make seed rank-dependent to vary shuffles but keep reproducibility per rank
     set_seed(int(cfg.run.seed) + get_rank())
     device = _resolve_device(cfg.run.device)
-    torch.backends.cudnn.benchmark = True
+
     
     # Load model/tokenizer (supports your local LoRA-wrapped Qwen class)
     if is_main_process():
@@ -566,8 +567,8 @@ def main(cfg: DictConfig):
     if should_use_ddp():
         ddp_metanet = DDP(
             metanetwork,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            output_device=device.index if device.type == "cuda" else None,
+            device_ids=[device.index] if device.type == "npu" else None,
+            output_device=device.index if device.type == "npu" else None,
             find_unused_parameters=False,
             broadcast_buffers=False,
         )
@@ -618,7 +619,7 @@ def main(cfg: DictConfig):
         logger.info("Preparing data...")
     if cfg.data.source == "transmla":
         # raise ValueError(f"transmal not used")
-        dataset = load_dataset(os.path.join("data", "transmla_pretrain_6B_tokens"), split="train")
+        dataset = load_dataset("../transmla_pretrain_6B_tokens", split="train")
         split_dataset = dataset.train_test_split(test_size=0.0001, seed=42)
         train_texts = split_dataset["train"]
         val_texts = split_dataset["test"]
@@ -630,13 +631,13 @@ def main(cfg: DictConfig):
         train_collator = PretrainCollator(tokenizer=tokenizer, metatrain=True, cfg=cfg, conversation_max_length=cfg.data.conversation_max_length, context_max_length=cfg.data.context_max_length)
         val_collator = PretrainCollator(tokenizer=tokenizer, metatrain=True, cfg=cfg, conversation_max_length=cfg.data.conversation_max_length, context_max_length=cfg.data.context_max_length)
     elif cfg.data.source == "grouptransmla":
-        dataset = load_dataset(os.path.join("data", "transmla_pretrain_6B_tokens"), split="train")
+        dataset = load_dataset("../transmla_pretrain_6B_tokens", split="train")
         # dataset = dataset.select(range(10000))
         split_dataset = dataset.train_test_split(test_size=0.0001, seed=42)
         train_texts = split_dataset["train"]
         val_texts = split_dataset["test"]
-        train_ds = GroupTextDataset(train_texts["text"], tokenizer, cfg.data.conversation_max_length, os.path.join("data", "transmla_pretrain_6B_tokens"), "train")
-        val_ds = GroupTextDataset(val_texts["text"], tokenizer, cfg.data.conversation_max_length, os.path.join("data", "transmla_pretrain_6B_tokens"), "val")
+        train_ds = GroupTextDataset(train_texts["text"], tokenizer, cfg.data.conversation_max_length, "../transmla_pretrain_6B_tokens", "train")
+        val_ds = GroupTextDataset(val_texts["text"], tokenizer, cfg.data.conversation_max_length, "../transmla_pretrain_6B_tokens", "val")
         train_collator = GroupPretrainCollator(tokenizer, cfg, conversation_max_length=cfg.data.conversation_max_length, context_max_length=cfg.data.context_max_length, metatrain=True)
         val_collator = GroupPretrainCollator(tokenizer, cfg, conversation_max_length=cfg.data.conversation_max_length, context_max_length=cfg.data.context_max_length, metatrain=True)
     elif cfg.data.source == "squad":
@@ -681,14 +682,14 @@ def main(cfg: DictConfig):
 
     
 
-    pin = (device.type == "cuda")
+    pin = (device.type == "npu")
 
     # Distributed samplers (only if world_size > 1)
     train_sampler = DistributedSampler(train_ds, num_replicas=get_world_size(), rank=get_rank(), shuffle=True, seed=cfg.run.seed) if get_world_size() > 1 else None
     val_sampler = DistributedSampler(val_ds, num_replicas=get_world_size(), rank=get_rank(), shuffle=False) if get_world_size() > 1 else None
 
     # Use a few workers by default when on GPU
-    num_workers_default = 2 if device.type == "cuda" else 0
+    num_workers_default = 2 if device.type == "npu" else 0
 
     train_loader = DataLoader(
         train_ds,
@@ -779,7 +780,7 @@ def main(cfg: DictConfig):
             else:
                 cur_metalora = merge_loradicts(metalora, ift_additional_metalora, method=cfg.metanetwork.method)
 
-            with torch.amp.autocast(enabled=(cfg.run.use_amp and device.type == "cuda"), device_type="cuda", dtype=amp_dtype):
+            with torch.amp.autocast(enabled=(cfg.run.use_amp and device.type == "npu"), device_type="npu", dtype=amp_dtype):
                 # Forward through possibly DDP-wrapped metanetwork
                 outputs = ddp_metanet(input_ids=input_ids, input_attention_mask=input_attention_mask, 
                                     evidence_ids=evidence_ids, evidence_attention_mask=evidence_attention_mask, 
@@ -887,8 +888,8 @@ def main(cfg: DictConfig):
                     if is_main_process():
                         logger.info(f"[Eval @ step {global_step}] loss={eval_metrics['eval_loss']:.4f} ppl={eval_metrics['perplexity']:.2f}")
         
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        if device.type == "npu":
+            torch_npu.npu.empty_cache()
         # Epoch-end eval/log (averaged)
         avg_epoch_loss_local = (epoch_loss / max(epoch_tokens, 1))
         avg_epoch_loss_world = distributed_mean(avg_epoch_loss_local, device)

@@ -1,14 +1,5 @@
 #!/bin/bash
 
-#SBATCH -J metalora
-#SBATCH -p IAI_SLURM_HGX
-#SBATCH --qos=16gpu-hgx
-#SBATCH -N 1
-#SBATCH --gres=gpu:4
-#SBATCH --time=48:00:00
-#SBATCH -c 64
-#SBATCH -o metalora.out
-#SBATCH -e metalora.err
 
 NAME=8gpu_8lora_128metalora_lr5e-5_grouppretrain_1150 # 4layer
 NUM_GPUS=8
@@ -18,7 +9,7 @@ SOURCE=grouptransmla
 TRAIN_BATCH_SIZE=1
 TEST_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=4
-USE_GRADIENT_CHECKPOINT=False
+USE_GRADIENT_CHECKPOINT=True
 RESUME_GLOBAL_STEP=latest   # -1: don't resume,   int: resume from global steps,  latest: resume from latest
 LEARNING_RATE=5e-5
 CONVERSATION_MAX_LEN=1150 # 1160   # Extra base len: 0 Extra chat len per turn: 11
@@ -30,17 +21,18 @@ METHOD=rl
 LORA_R=8
 METALORA_R=128
 
-# Find available port
-while true; do
-    if ! nc -z 127.0.0.1 $MASTER_PORT; then
-        break
-    fi
-    ((MASTER_PORT++))
-done
+# # Find available port
+# while true; do
+#     if ! nc -z 127.0.0.1 $MASTER_PORT; then
+#         break
+#     fi
+#     ((MASTER_PORT++))
+# done
+set -o pipefail
 
 export HYDRA_FULL_ERROR=1
 export OMP_NUM_THREADS=4
-export NCCL_DEBUG=WARN
+export ASCEND_GLOBAL_LOG_LEVEL=2
 export TORCH_DISTRIBUTED_DEBUG=INFO
 
 python generate_group_idx.py  \
@@ -62,11 +54,11 @@ python generate_group_idx.py  \
     metanetwork.method=$METHOD \
     model.lora_r=$LORA_R \
     model.metalora_r=$METALORA_R \
-    > tmp_pretrain_$NAME.txt 2>&1
+    2>&1 | tee tmp_pretrain_$NAME.txt
 
 wait
 
-nohup torchrun \
+torchrun \
     --nproc_per_node=$NUM_GPUS \
     --nnodes=1 \
     --node_rank=0 \
@@ -91,4 +83,5 @@ nohup torchrun \
     metanetwork.method=$METHOD \
     model.lora_r=$LORA_R \
     model.metalora_r=$METALORA_R \
-    > tmp_pretrain_$NAME.txt 2>&1 &
+    2>&1 | tee tmp_pretrain_$NAME.txt
+

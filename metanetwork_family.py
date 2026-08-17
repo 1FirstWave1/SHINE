@@ -146,8 +146,8 @@ class Metanetwork(nn.Module):
     def config(self):
         # Prefer live inner config if present; else fall back to cached copy
         return getattr(self.metamodel, "config", None)
-
-    @torch.compile # (mode="max-autotune")
+    #暂时关闭complie，观察是否可行
+    # @torch.compile # (mode="max-autotune")
     def forward(self, input_ids, input_attention_mask, evidence_ids, evidence_attention_mask, metalora = None, labels = None, use_metanet = True, use_gradient_checkpoint = False, **kwargs) -> dict:
         '''
         memory_states: (batch_size, num_layer, num_mem_token, hidden_size)
@@ -167,6 +167,5 @@ class Metanetwork(nn.Module):
         plain_output = self.metanetwork(memory_states)  # (batch_size, output_dim)
         loradict = self.metamodel.generate_lora_dict(self.lora_r, scale=self.scale, plain_tensor=plain_output)
         return loradict if not return_plain else (loradict, plain_output)
-    
     
     

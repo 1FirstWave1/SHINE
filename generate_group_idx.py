@@ -14,6 +14,7 @@ import numpy as np
 import math
 
 import torch
+import torch_npu
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -71,10 +72,10 @@ from utils.myinit import _resolve_device, _import_class
 from collections import OrderedDict
 from typing import Optional, Union, Mapping, Sequence
 logger = get_logger("metalora")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+torch_npu.npu.matmul.allow_hf32 = True
+torch_npu.npu.conv.allow_hf32 = True
+torch.backends.mha.set_fastpath_enabled(False)
 
 @hydra.main(version_base=None, config_path="configs")
 def main(cfg: DictConfig):   
@@ -108,16 +109,17 @@ def main(cfg: DictConfig):
     if is_main_process():
         logger.info("Preparing data...")
     if cfg.data.source == "grouptransmla":
-        dataset = load_dataset(os.path.join("data", "transmla_pretrain_6B_tokens"), split="train")
+        dataset = load_dataset('../transmla_pretrain_6B_tokens', split="train")
         # dataset = dataset.select(range(10000))
         split_dataset = dataset.train_test_split(test_size=0.0001, seed=42)
         train_texts = split_dataset["train"]
         val_texts = split_dataset["test"]
-        train_ds = GroupTextDataset(train_texts["text"], tokenizer, cfg.data.conversation_max_length, os.path.join("data", "transmla_pretrain_6B_tokens"), "train", preprocess_mode=True, overwrite=False)
-        val_ds = GroupTextDataset(val_texts["text"], tokenizer, cfg.data.conversation_max_length, os.path.join("data", "transmla_pretrain_6B_tokens"), "val", preprocess_mode=True , overwrite=False)
+        train_ds = GroupTextDataset(train_texts["text"], tokenizer, cfg.data.conversation_max_length, '../transmla_pretrain_6B_tokens', "train", map_num_proc=32, preprocess_mode=True, overwrite=False)
+        val_ds = GroupTextDataset(val_texts["text"], tokenizer, cfg.data.conversation_max_length, '../transmla_pretrain_6B_tokens', "val", map_num_proc=32, preprocess_mode=True , overwrite=False)
     else:
         raise ValueError(f"Unknown data source: {cfg.data.source}")
 
 
 if __name__ == "__main__":
     main()
+        

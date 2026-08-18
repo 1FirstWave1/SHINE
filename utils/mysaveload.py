@@ -28,9 +28,17 @@ def save_checkpoint(metanetwork, out_dir: str, metalora: Any, ift_additional_met
 def load_checkpoint(metanetwork, in_dir, device: str, load_ift_additional_metalora: bool = False, zero_ift_additional_metalora: bool = False):
     metanetwork.to("cpu")
     if metanetwork.metamodel.model.use_mem_token:
+        target_mem_tokens = metanetwork.metamodel.model.mem_tokens
         saved_mem_tokens = torch.load(os.path.join(in_dir, "mem_tokens.pt"), map_location="cpu", weights_only=False)
-        assert saved_mem_tokens.shape == metanetwork.metamodel.model.mem_tokens.shape, f"Shape mismatch for mem_tokens: saved {saved_mem_tokens.shape}, model {metanetwork.metamodel.model.mem_tokens.shape}"
-        metanetwork.metamodel.model.mem_tokens = saved_mem_tokens
+        assert saved_mem_tokens.shape == target_mem_tokens.shape, f"Shape mismatch for mem_tokens: saved {saved_mem_tokens.shape}, model {target_mem_tokens.shape}"
+        # Keep the registered Parameter and match the newly configured Qwen dtype.
+        with torch.no_grad():
+            target_mem_tokens.copy_(
+                saved_mem_tokens.to(
+                    device=target_mem_tokens.device,
+                    dtype=target_mem_tokens.dtype,
+                )
+            )
     metanetwork.metanetwork.load_state_dict(torch.load(os.path.join(in_dir, "metanetwork.pth"), weights_only=False, map_location="cpu"))
     metalora = torch.load(os.path.join(in_dir, "metalora.pth"), map_location="cpu", weights_only=False)
     metanetwork.to(device)

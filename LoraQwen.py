@@ -568,7 +568,13 @@ class LoraQwen3Model(Qwen3PreTrainedModel):
         else:
             self.use_mem_token = True
             self.num_mem_token = config.num_mem_token
-            self.mem_tokens = nn.Parameter(torch.zeros((self.num_mem_token, config.hidden_size), requires_grad=True), requires_grad=True)
+            self.mem_tokens = nn.Parameter(
+                torch.zeros(
+                    (self.num_mem_token, config.hidden_size),
+                    dtype=torch.float32,
+                ),
+                requires_grad=True,
+            )
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -619,7 +625,8 @@ class LoraQwen3Model(Qwen3PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
             if self.use_mem_token and not ignore_mem_token:
-                inputs_embeds = torch.concat((inputs_embeds, self.mem_tokens.unsqueeze(0).repeat(inputs_embeds.shape[0], 1, 1)), dim=-2)
+                mem_tokens_compute = self.mem_tokens.to(dtype=inputs_embeds.dtype)
+                inputs_embeds = torch.concat((inputs_embeds, mem_tokens_compute.unsqueeze(0).repeat(inputs_embeds.shape[0], 1, 1)), dim=-2)
                 if attention_mask is not None:
                     attention_mask = torch.concat([attention_mask, torch.ones_like(attention_mask[:, [0]]).repeat(1, self.num_mem_token)], dim=-1)
 

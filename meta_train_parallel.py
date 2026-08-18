@@ -444,13 +444,18 @@ def main(cfg: DictConfig):
         logger.info("Loading model & tokenizer...")
     MetaModelCls = _import_class(cfg.model.metamodel_class_path)
     ConfigCls = _import_class(cfg.model.config_class_path)
+    model_dtype = getattr(torch, cfg.model.dtype)
     config = ConfigCls.from_pretrained(cfg.model.model_from)
     config.num_mem_token = -1
     cfg.hidden_size = config.hidden_size
     cfg.num_layers = config.num_hidden_layers
 
     if cfg.metanetwork.type in ["transformer", "linear", "lineargate"]:
-        tmp_model = MetaModelCls.from_pretrained(cfg.model.model_from, config=config)
+        tmp_model = MetaModelCls.from_pretrained(
+            cfg.model.model_from,
+            config=config,
+            dtype=model_dtype,
+        )
         lora_numel = tmp_model.lora_params_numel(cfg.model.lora_r)
         assert lora_numel % (cfg.hidden_size * cfg.num_layers) == 0, \
             "For transformer metanetwork, num_mem_token must be set to model.lora_params_numel(lora_r) * mean_pool_size / (hidden_size * num_layers)"
@@ -469,9 +474,24 @@ def main(cfg: DictConfig):
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.tokenizer_from, padding_side="left", use_fast=True)
     tokenizer.add_tokens(['<RECON>', '<COMP>', '<NOTHING>'])
     tokenizer.chat_template = "{%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0].role == 'system' %}\n        {{- messages[0].content + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0].content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}\n        {%- set ns.multi_step_tool = false %}\n        {%- set ns.last_query_index = index %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if message.content is string %}\n        {%- set content = message.content %}\n    {%- else %}\n        {%- set content = '' %}\n    {%- endif %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {%- if (loop.last or (not loop.last and reasoning_content)) and (enable_thinking is not defined or enable_thinking != false) %}\n                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}\n            {%- else %}\n                {{- '<|im_start|>' + message.role + '\\n' + content }}\n            {%- endif %}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if (loop.first and content) or (not loop.first) %}\n                    {{- '\\n' }}\n                {%- endif %}\n                {%- if tool_call.function %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {{- '<tool_call>\\n{\"name\": \"' }}\n                {{- tool_call.name }}\n                {{- '\", \"arguments\": ' }}\n                {%- if tool_call.arguments is string %}\n                    {{- tool_call.arguments }}\n                {%- else %}\n                    {{- tool_call.arguments | tojson }}\n                {%- endif %}\n                {{- '}\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.first or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is not defined or enable_thinking != false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
-    metamodel = MetaModelCls.from_pretrained(cfg.model.model_from, config=config)
+    metamodel = MetaModelCls.from_pretrained(
+        cfg.model.model_from,
+        config=config,
+        dtype=model_dtype,
+    )
+    # from_pretrained(dtype=...) casts every floating-point parameter, including
+    # the trainable memory embeddings. Keep their master parameter in FP32 while
+    # the frozen Qwen weights use the configured model dtype.
+    if metamodel.model.use_mem_token:
+        metamodel.model.mem_tokens = torch.nn.Parameter(
+            metamodel.model.mem_tokens.detach().to(dtype=torch.float32),
+            requires_grad=True,
+        )
     metamodel.reset_mem_tokens()
     metamodel.resize_token_embeddings(len(tokenizer))
+
+    if is_main_process():
+        logger.info(f"Configured Qwen dtype: {model_dtype}")
     
     # nothing_id = tokenizer.convert_tokens_to_ids("<NOTHING>")
     # with torch.no_grad():
@@ -581,18 +601,33 @@ def main(cfg: DictConfig):
     no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "norm.weight", "norm1", "norm2"]
     grouped_params = [
         {
-            "params": [p for n, p in ddp_metanet.named_parameters() if (not any(nd in n for nd in no_decay) and not n.startswith("module.metamodel"))],
+            "params": [
+                p for n, p in ddp_metanet.named_parameters()
+                if (
+                    p.requires_grad
+                    and not any(nd in n for nd in no_decay)
+                )
+            ],
             "weight_decay": cfg.optim.weight_decay,
         },
         {
-            "params": [p for n, p in ddp_metanet.named_parameters() if (any(nd in n for nd in no_decay) and not n.startswith("module.metamodel"))],
+            "params": [
+                p for n, p in ddp_metanet.named_parameters()
+                if (
+                    p.requires_grad
+                    and any(nd in n for nd in no_decay)
+                )
+            ],
             "weight_decay": 0.0,
         },
         {
-            "params": list(iter_learnable_tensors(metalora) if not USE_ADDITIONAL_METALORA else iter_learnable_tensors(ift_additional_metalora)),
+            "params": list(
+                iter_learnable_tensors(metalora)
+                if not USE_ADDITIONAL_METALORA
+                else iter_learnable_tensors(ift_additional_metalora)
+            ),
             "weight_decay": cfg.optim.weight_decay,
-        }
-        # mem_tokens are already part of metanetwork's parameters
+        },
     ]
     
     def assert_grouped_params_require_grad(grouped_params):

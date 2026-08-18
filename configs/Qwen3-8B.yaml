@@ -6,7 +6,7 @@ test_global_step: latest # int: test at global steps,  latest: test at latest
 
 run:
   seed: 42
-  use_amp: false           # set false to disable AMP (can't be used now, bugs)
+  use_amp: true
   gradient_accumulation_steps: 4
   device: npu                # auto | cuda | cpu
   use_gradient_checkpoint: false
@@ -54,6 +54,7 @@ save:
 # If you use a custom local module for LoRA-wrapped Qwen, keep it here.
 # Otherwise, replace with a transformers model import path and update train.py accordingly.
 model:
+  dtype: bfloat16 # float32 | float16 | bfloat16; controls frozen Qwen weight storage
   lora_r: 4
   metalora_r: 4
   ift_additional_metalora_r: -1 # <0: finetune pretrain metalora;  >=0: freeze pretrain metalora, add new metalora with this r

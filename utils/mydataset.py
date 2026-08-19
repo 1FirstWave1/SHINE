@@ -60,6 +60,7 @@ class TextDataset(Dataset):
     def __getitem__(self, idx) -> Dict[str, Any]:
         return {"text": str(self.texts[idx])}
 
+#多条短文本装入一个group
 class GroupTextDataset(Dataset):
     """
     DDP-safe dataset:
@@ -270,6 +271,7 @@ class SquadDataset(Dataset):
                 answer[i] = answer[i][0].upper() + answer[i][1:]
         return {"evidence": str(self.data[idx]['context']).strip(), "question": str(self.data[idx]['question']).strip(), "answer": answer}
 
+#仍会将不同上下文进行随机组合来填充长度
 class GroupedSquadDataset(Dataset):
     def __init__(
         self,

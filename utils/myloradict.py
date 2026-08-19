@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 import torch
+import torch.distributed as dist
 
 def iter_learnable_tensors(tree, prefix="root"):
     """Yield leaf te nsors with requires_grad=True from nested dict/list/tuple, 
@@ -20,6 +21,60 @@ def iter_learnable_tensors(tree, prefix="root"):
                     f"grad_fn={tree.grad_fn}")
                 # optionally still yield it or raise
                 raise ValueError(f"Found non-leaf tensor at '{prefix}'")
+
+
+@torch.no_grad()
+def broadcast_loradict(loradict: dict, src: int = 0) -> int:
+    """Broadcast learnable LoRA tensors from ``src`` to every DDP rank.
+    """
+    if loradict is None or not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    tensors = list(iter_learnable_tensors(loradict))
+    for tensor in tensors:
+        dist.broadcast(tensor, src=src)
+    return len(tensors)
+
+
+@torch.no_grad()
+def average_loradict_gradients(loradict: dict) -> int:
+    """Average external LoRA gradients across all initialized DDP ranks.
+
+    Returns the number of gradients averaged. This is a no-op for a
+    single-process run.
+    """
+    if loradict is None or not (dist.is_available() and dist.is_initialized()):
+        return 0
+
+    tensors = list(iter_learnable_tensors(loradict))
+    if not tensors:
+        return 0
+
+    world_size = dist.get_world_size()
+    grad_counts = torch.tensor(
+        [int(tensor.grad is not None) for tensor in tensors],
+        dtype=torch.int32,
+        device=tensors[0].device,
+    )
+    dist.all_reduce(grad_counts, op=dist.ReduceOp.SUM)
+
+    inconsistent = (grad_counts != 0) & (grad_counts != world_size)
+    if bool(inconsistent.any().item()):
+        indices = inconsistent.nonzero(as_tuple=False).flatten().tolist()
+        raise RuntimeError(
+            "LoRA gradient presence differs across DDP ranks for tensor "
+            f"indices {indices[:20]}"
+        )
+
+    synced = 0
+    for tensor, count in zip(tensors, grad_counts.tolist()):
+        if count == 0:
+            continue
+        dist.all_reduce(tensor.grad, op=dist.ReduceOp.SUM)
+        tensor.grad.div_(world_size)
+        synced += 1
+
+    return synced
 
 def merge_loradicts(lora1: dict, lora2: dict, method: str) -> dict:
     """

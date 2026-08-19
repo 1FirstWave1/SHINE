@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+#有额外的sft阶段的新增训练metalora，默认不启用
 from csv import writer
 import os
 import math
@@ -69,7 +69,14 @@ from utils.myddp import (
     distributed_mean,
     barrier,
 )
-from utils.myloradict import iter_learnable_tensors, merge_loradicts, freeze_loradict, loradict_all_requires_grad
+from utils.myloradict import (
+    iter_learnable_tensors,
+    merge_loradicts,
+    freeze_loradict,
+    loradict_all_requires_grad,
+    broadcast_loradict,
+    average_loradict_gradients,
+)
 from utils.myinit import _resolve_device, _import_class
 from collections import OrderedDict
 from typing import Optional, Union, Mapping, Sequence
@@ -79,6 +86,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 torch_npu.npu.matmul.allow_hf32 = True
 torch_npu.npu.conv.allow_hf32 = True
 
+#手动token解码，查看token logits, top-k等数据
 # @torch.no_grad()
 # def generate_stepwise(
 #     model,
@@ -345,7 +353,7 @@ def evaluate(metanetwork_ddp_or_module, dataloader, device, use_amp: bool = Fals
     avg_reg_loss = total_reg_loss / max(n_tokens, 1) if use_metanet else None
     ppl = math.exp(avg_loss) if avg_loss < 20 else float("inf")
 
-
+    #选择验证集batch生成文本和标准答案，
     # batch = next(iter(test_loader))
     # evidence_ids = batch["evidence_ids"].to(device, non_blocking=True)
     # evidence_attention_mask = batch["evidence_attention_mask"].to(device, non_blocking=True)
@@ -576,6 +584,17 @@ def main(cfg: DictConfig):
         else:
             # Initialize metalora
             metalora = metanetwork.metamodel.init_lora_dict(cfg.model.metalora_r, scale=cfg.metanetwork.transformer_cfg.scale, device=device)
+
+    # Meta-LoRA is an optimizer input, but it is not a registered parameter of
+    # the DDP-wrapped metanetwork. Synchronize the trainable LoRA initialization
+    # explicitly; its accumulated gradients are reduced before optimizer.step.
+    trainable_metalora = ift_additional_metalora if USE_ADDITIONAL_METALORA else metalora
+    num_broadcast_metalora_tensors = broadcast_loradict(trainable_metalora)
+    if is_main_process() and ddp_is_active():
+        logger.info(
+            "Broadcast %d trainable Meta-LoRA tensors from rank 0.",
+            num_broadcast_metalora_tensors,
+        )
         
     metanetwork.metamodel.config.use_cache = False
 
@@ -839,6 +858,8 @@ def main(cfg: DictConfig):
                 logger.info(res)
 
             if step % max(1, cfg.run.gradient_accumulation_steps) == 0 or step == len(train_loader):
+                average_loradict_gradients(trainable_metalora)
+
                 if cfg.optim.grad_clip_norm and cfg.optim.grad_clip_norm > 0:
                     for group in optimizer.param_groups:
                         # # ---- Compute and print grad norm BEFORE clipping ----
@@ -911,7 +932,6 @@ def main(cfg: DictConfig):
 
                 # ---- Eval + best checkpoint ----
                 if getattr(cfg.eval, "eval_steps", 0) and global_step % cfg.eval.eval_steps == 0:
-                    ###############################TODO add additional metalora handling here###############################
                     if not USE_ADDITIONAL_METALORA:
                         cur_metalora = metalora
                     else:

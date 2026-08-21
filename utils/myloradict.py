@@ -1,6 +1,69 @@
 from collections.abc import Mapping, Sequence
 import torch
+from torch import nn
 import torch.distributed as dist
+
+
+class MetaLoRAParameters(nn.Module):
+    """Own a nested Meta-LoRA tensor tree as registered parameters.
+
+    ``as_loradict()`` reconstructs the original nested-dict interface using
+    references to the registered parameters, so existing functional LoRA
+    forwards do not need to know how the persistent tensors are stored.
+    """
+
+    def __init__(self, loradict: Mapping):
+        super().__init__()
+        if not isinstance(loradict, Mapping):
+            raise TypeError(f"loradict must be a mapping, got {type(loradict)}")
+        self._next_parameter_id = 0
+        self._tree_spec = self._register_tree(loradict, path="root")
+
+    def _register_tree(self, obj, path):
+        if torch.is_tensor(obj):
+            if not obj.is_leaf:
+                raise ValueError(
+                    f"Persistent Meta-LoRA tensor at '{path}' must be a leaf tensor"
+                )
+            name = f"tensor_{self._next_parameter_id:06d}"
+            self._next_parameter_id += 1
+            parameter = (
+                obj
+                if isinstance(obj, nn.Parameter)
+                else nn.Parameter(obj.detach(), requires_grad=obj.requires_grad)
+            )
+            self.register_parameter(name, parameter)
+            return ("parameter", name)
+
+        if isinstance(obj, Mapping):
+            return (
+                "mapping",
+                [
+                    (key, self._register_tree(value, f"{path}.{key}"))
+                    for key, value in obj.items()
+                ],
+            )
+
+        if obj is None:
+            return ("constant", None)
+
+        raise TypeError(
+            f"Unsupported Meta-LoRA value at '{path}': {type(obj)}"
+        )
+
+    def _restore_tree(self, spec):
+        kind, value = spec
+        if kind == "parameter":
+            return self.get_parameter(value)
+        if kind == "mapping":
+            return {key: self._restore_tree(child) for key, child in value}
+        if kind == "constant":
+            return value
+        raise RuntimeError(f"Unknown Meta-LoRA tree spec kind: {kind}")
+
+    def as_loradict(self) -> dict:
+        """Return the original nested structure backed by registered parameters."""
+        return self._restore_tree(self._tree_spec)
 
 def iter_learnable_tensors(tree, prefix="root"):
     """Yield leaf te nsors with requires_grad=True from nested dict/list/tuple, 

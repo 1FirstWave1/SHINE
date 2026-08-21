@@ -70,12 +70,9 @@ from utils.myddp import (
     barrier,
 )
 from utils.myloradict import (
-    iter_learnable_tensors,
     merge_loradicts,
     freeze_loradict,
     loradict_all_requires_grad,
-    broadcast_loradict,
-    average_loradict_gradients,
 )
 from utils.myinit import _resolve_device, _import_class
 from collections import OrderedDict
@@ -85,6 +82,7 @@ logger = get_logger("metalora")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 torch_npu.npu.matmul.allow_hf32 = True
 torch_npu.npu.conv.allow_hf32 = True
+torch.backends.mha.set_fastpath_enabled(False)
 
 #手动token解码，查看token logits, top-k等数据
 # @torch.no_grad()
@@ -342,7 +340,7 @@ def evaluate(metanetwork_ddp_or_module, dataloader, device, use_amp: bool = Fals
 
     # Reduce across ranks
     if ddp_is_active():
-        t = torch.tensor([total_loss, n_tokens, total_reg_loss], dtype=torch.float64, device=device)
+        t = torch.tensor([total_loss, n_tokens, total_reg_loss], dtype=torch.float32, device=device)
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         total_loss = float(t[0].item())
         n_tokens = int(t[1].item())
@@ -434,6 +432,9 @@ def main(cfg: DictConfig):
     if cfg.mode in ["train", "iftpwc"]:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
+    # Bind each process to its LOCAL_RANK device before HCCL initialization.
+    device = _resolve_device(cfg.run.device)
+
     # ========= DDP init (safe for single-process) =========
     ddp_init_if_needed()
     
@@ -444,7 +445,6 @@ def main(cfg: DictConfig):
     # Seed & device
     # Make seed rank-dependent to vary shuffles but keep reproducibility per rank
     set_seed(int(cfg.run.seed) + get_rank())
-    device = _resolve_device(cfg.run.device)
 
     
     # Load model/tokenizer (supports your local LoRA-wrapped Qwen class)
@@ -585,17 +585,12 @@ def main(cfg: DictConfig):
             # Initialize metalora
             metalora = metanetwork.metamodel.init_lora_dict(cfg.model.metalora_r, scale=cfg.metanetwork.transformer_cfg.scale, device=device)
 
-    # Meta-LoRA is an optimizer input, but it is not a registered parameter of
-    # the DDP-wrapped metanetwork. Synchronize the trainable LoRA initialization
-    # explicitly; its accumulated gradients are reduced before optimizer.step.
-    trainable_metalora = ift_additional_metalora if USE_ADDITIONAL_METALORA else metalora
-    num_broadcast_metalora_tensors = broadcast_loradict(trainable_metalora)
-    if is_main_process() and ddp_is_active():
-        logger.info(
-            "Broadcast %d trainable Meta-LoRA tensors from rank 0.",
-            num_broadcast_metalora_tensors,
+    metalora = metanetwork.register_metalora("metalora", metalora)
+    if ift_additional_metalora is not None:
+        ift_additional_metalora = metanetwork.register_metalora(
+            "ift_additional_metalora", ift_additional_metalora
         )
-        
+
     metanetwork.metamodel.config.use_cache = False
 
     # ====== Wrap ONLY the trainable module in DDP when applicable ======
@@ -603,6 +598,12 @@ def main(cfg: DictConfig):
     # if is_main_process():
     #     logger.info("attn_implementation: " + str(metanetwork.metamodel.attn_implementation))
     metanetwork.to(device)
+    # Refresh functional views in case Module.to() replaced any Parameter object.
+    metalora = metanetwork.get_metalora("metalora")
+    if ift_additional_metalora is not None:
+        ift_additional_metalora = metanetwork.get_metalora(
+            "ift_additional_metalora"
+        )
     if should_use_ddp():
         ddp_metanet = DDP(
             metanetwork,
@@ -638,14 +639,6 @@ def main(cfg: DictConfig):
                 )
             ],
             "weight_decay": 0.0,
-        },
-        {
-            "params": list(
-                iter_learnable_tensors(metalora)
-                if not USE_ADDITIONAL_METALORA
-                else iter_learnable_tensors(ift_additional_metalora)
-            ),
-            "weight_decay": cfg.optim.weight_decay,
         },
     ]
     
@@ -858,8 +851,6 @@ def main(cfg: DictConfig):
                 logger.info(res)
 
             if step % max(1, cfg.run.gradient_accumulation_steps) == 0 or step == len(train_loader):
-                average_loradict_gradients(trainable_metalora)
-
                 if cfg.optim.grad_clip_norm and cfg.optim.grad_clip_norm > 0:
                     for group in optimizer.param_groups:
                         # # ---- Compute and print grad norm BEFORE clipping ----

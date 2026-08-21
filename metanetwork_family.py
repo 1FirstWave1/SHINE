@@ -5,6 +5,7 @@ import torch.nn as nn
 import weakref
 import os
 from utils.myddp import is_main_process, barrier
+from utils.myloradict import MetaLoRAParameters
 
 def generate_couple_mask(idx_range, couple_hidden_size, couple_num_tokens):
     mask = torch.ones((couple_num_tokens, couple_num_tokens), dtype=torch.bool)
@@ -125,6 +126,7 @@ class Metanetwork(nn.Module):
         self.lora_r = cfg.model.lora_r
         self.output_dim = output_dim
         self.metamodel = metamodel
+        self.metalora_parameters = nn.ModuleDict()
         self.idx_range, end = self.metamodel.divide_idx(self.lora_r, 0)
         self.idx_range.append(end)
         self.adapter_reg = cfg.optim.adapter_reg if hasattr(cfg, 'optim') else 0.0
@@ -147,6 +149,19 @@ class Metanetwork(nn.Module):
     def config(self):
         # Prefer live inner config if present; else fall back to cached copy
         return getattr(self.metamodel, "config", None)
+
+    def register_metalora(self, name: str, loradict: dict) -> dict:
+        """Register a persistent Meta-LoRA tree and return its dict interface."""
+        if name in self.metalora_parameters:
+            raise ValueError(f"Meta-LoRA parameter tree '{name}' is already registered")
+        self.metalora_parameters[name] = MetaLoRAParameters(loradict)
+        return self.metalora_parameters[name].as_loradict()
+
+    def get_metalora(self, name: str) -> dict:
+        """Return a registered persistent Meta-LoRA using the functional API."""
+        if name not in self.metalora_parameters:
+            raise KeyError(f"Meta-LoRA parameter tree '{name}' is not registered")
+        return self.metalora_parameters[name].as_loradict()
     #暂时关闭complie，观察是否可行
     # @torch.compile # (mode="max-autotune")
     def forward(self, input_ids, input_attention_mask, evidence_ids, evidence_attention_mask, metalora = None, labels = None, use_metanet = True, use_gradient_checkpoint = False, **kwargs) -> dict:

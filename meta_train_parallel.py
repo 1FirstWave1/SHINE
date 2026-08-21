@@ -70,6 +70,7 @@ from utils.myddp import (
     barrier,
 )
 from utils.myloradict import (
+    iter_learnable_tensors,
     merge_loradicts,
     freeze_loradict,
     loradict_all_requires_grad,
@@ -83,6 +84,61 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 torch_npu.npu.matmul.allow_hf32 = True
 torch_npu.npu.conv.allow_hf32 = True
 torch.backends.mha.set_fastpath_enabled(False)
+
+@torch.no_grad()
+def debug_metalora_across_ranks(metalora, tag=""):
+    if not ddp_is_active():
+        tensor = next(iter(iter_learnable_tensors(metalora)))
+        print(
+            f"[{tag}] single process metalora mean: "
+            f"{tensor.detach().float().mean().item()}"
+        )
+        return
+
+    tensor = next(iter(iter_learnable_tensors(metalora)))
+
+    # 多看几个统计量，单独看 mean 有可能差异很小
+    flat = tensor.detach().float().reshape(-1)
+
+    local_stats = torch.stack([
+        flat.mean(),
+        flat.std(),
+        flat.norm(),
+        flat[0],
+    ])
+
+    gathered = [
+        torch.zeros_like(local_stats)
+        for _ in range(dist.get_world_size())
+    ]
+
+    # 必须由所有 rank 执行
+    dist.all_gather(gathered, local_stats)
+
+    # 只有输出放在 rank 0
+    if is_main_process():
+        print(f"\n[{tag}] metalora statistics across ranks:")
+
+        for rank, stats in enumerate(gathered):
+            mean, std, norm, first = stats.tolist()
+            print(
+                f"rank={rank}: "
+                f"mean={mean:.10e}, "
+                f"std={std:.10e}, "
+                f"norm={norm:.10e}, "
+                f"first={first:.10e}"
+            )
+
+        reference = gathered[0]
+        max_stat_diff = max(
+            (stats - reference).abs().max().item()
+            for stats in gathered[1:]
+        )
+
+        print(
+            f"[{tag}] max statistics difference "
+            f"from rank 0: {max_stat_diff:.10e}\n"
+        )
 
 #手动token解码，查看token logits, top-k等数据
 # @torch.no_grad()
@@ -533,6 +589,7 @@ def main(cfg: DictConfig):
         raise ValueError(f"Invalid resume_global_step: {cfg.resume_global_step}")
     
     resume_state = None
+    ift_additional_metalora = None
     USE_ADDITIONAL_METALORA = bool(cfg.model.ift_additional_metalora_r >= 0 and cfg.mode == "train")
     if is_main_process():
         logger.info(f"USE_ADDITIONAL_METALORA: {USE_ADDITIONAL_METALORA}, r={cfg.model.ift_additional_metalora_r}")
@@ -868,6 +925,12 @@ def main(cfg: DictConfig):
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 global_step += 1
+                
+                if global_step in (1, 10, 100):
+                    debug_metalora_across_ranks(
+                        metalora,
+                        tag=f"after_optimizer_step_{global_step}",
+                    )
 
                 # Periodic logging (only on rank 0, with distributed averages)
                 if cfg.logging.logging_steps and global_step % cfg.logging.logging_steps == 0:
